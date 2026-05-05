@@ -187,6 +187,8 @@ extern const FFCodec ff_jpeg2000_decoder;
 extern const FFCodec ff_jpegls_encoder;
 extern const FFCodec ff_jpegls_decoder;
 extern const FFCodec ff_jv_decoder;
+extern const FFCodec ff_jvid_decoder;
+extern const FFCodec ff_jvid_encoder;
 extern const FFCodec ff_kgv1_decoder;
 extern const FFCodec ff_kmvc_decoder;
 extern const FFCodec ff_lagarith_decoder;

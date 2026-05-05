@@ -1606,6 +1606,7 @@ static int map_auto_video(Muxer *mux, const OptionsContext *o)
     InputStreamGroup *best_istg = NULL;
     InputStream *best_ist = NULL;
     int64_t best_score = 0;
+    int map_all = !strcmp(oc->oformat->name, "jmov");
     int qcr;
 
     /* video: highest resolution */
@@ -1666,6 +1667,12 @@ static int map_auto_video(Muxer *mux, const OptionsContext *o)
             if((qcr!=MKTAG('A', 'P', 'I', 'C')) && (ist->st->disposition & AV_DISPOSITION_ATTACHED_PIC))
                 score = 1;
 
+            if (map_all && !(ist->st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                int ret = ost_add(mux, o, AVMEDIA_TYPE_VIDEO, ist, NULL, NULL, NULL);
+                if (ret < 0)
+                    return ret;
+            }
+
             if (score > file_best_score) {
                 if((qcr==MKTAG('A', 'P', 'I', 'C')) && !(ist->st->disposition & AV_DISPOSITION_ATTACHED_PIC))
                     continue;
@@ -1674,6 +1681,8 @@ static int map_auto_video(Muxer *mux, const OptionsContext *o)
                 file_best_istg  = NULL;
             }
         }
+        if (map_all)
+            continue;
         if (file_best_istg) {
             file_best_score -= 5000000*!!(file_best_istg->stg->disposition & AV_DISPOSITION_DEFAULT);
             if (file_best_score > best_score) {
@@ -1713,6 +1722,7 @@ static int map_auto_audio(Muxer *mux, const OptionsContext *o)
     AVFormatContext *oc = mux->fc;
     InputStream *best_ist = NULL;
     int best_score = 0;
+    int map_all = !strcmp(oc->oformat->name, "jmov");
 
         /* audio: most channels */
     if (av_guess_codec(oc->oformat, NULL, oc->url, NULL, AVMEDIA_TYPE_AUDIO) == AV_CODEC_ID_NONE)
@@ -1733,11 +1743,18 @@ static int map_auto_audio(Muxer *mux, const OptionsContext *o)
             score = ist->st->codecpar->ch_layout.nb_channels
                     + 100000000 * !!(ist->st->event_flags & AVSTREAM_EVENT_FLAG_NEW_PACKETS)
                     + 5000000*!!(ist->st->disposition & AV_DISPOSITION_DEFAULT);
+            if (map_all) {
+                int ret = ost_add(mux, o, AVMEDIA_TYPE_AUDIO, ist, NULL, NULL, NULL);
+                if (ret < 0)
+                    return ret;
+            }
             if (score > file_best_score) {
                 file_best_score = score;
                 file_best_ist   = ist;
             }
         }
+        if (map_all)
+            continue;
         if (file_best_ist) {
             file_best_score -= 5000000*!!(file_best_ist->st->disposition & AV_DISPOSITION_DEFAULT);
             if (file_best_score > best_score) {
@@ -1756,6 +1773,7 @@ static int map_auto_subtitle(Muxer *mux, const OptionsContext *o)
 {
     AVFormatContext *oc = mux->fc;
     const char *subtitle_codec_name = NULL;
+    int map_all = !strcmp(oc->oformat->name, "jmov");
 
         /* subtitles: pick first */
     subtitle_codec_name = opt_match_per_type_str(&o->codec_names, 's');
@@ -1784,7 +1802,11 @@ static int map_auto_subtitle(Muxer *mux, const OptionsContext *o)
                 input_descriptor && output_descriptor &&
                 (!input_descriptor->props ||
                  !output_descriptor->props)) {
-                return ost_add(mux, o, AVMEDIA_TYPE_SUBTITLE, ist, NULL, NULL, NULL);
+                int ret = ost_add(mux, o, AVMEDIA_TYPE_SUBTITLE, ist, NULL, NULL, NULL);
+                if (ret < 0)
+                    return ret;
+                if (!map_all)
+                    return 0;
             }
         }
 
