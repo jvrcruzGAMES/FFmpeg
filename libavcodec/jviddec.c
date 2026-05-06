@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "libavutil/frame.h"
+#include "libavutil/hwcontext.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
@@ -323,6 +325,9 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     JVIDContext *s = avctx->priv_data;
     z_stream *zstream = &s->zstream.zstream;
     JVIDHeader hdr;
+    AVHWFramesContext *frames_ctx = NULL;
+    AVFrame *sw_frame = NULL;
+    AVFrame *dst_frame = frame;
     enum AVPixelFormat pix_fmt;
     uint8_t *src_data[4] = { 0 };
     int src_linesize[4] = { 0 };
@@ -366,10 +371,36 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (compressed_size < 0)
         return AVERROR_INVALIDDATA;
 
-    avctx->pix_fmt = pix_fmt;
-    ret = ff_get_buffer(avctx, frame, 0);
-    if (ret < 0)
-        return ret;
+    if (avctx->hw_frames_ctx) {
+        frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
+        if (frames_ctx->format != AV_PIX_FMT_CUDA ||
+            frames_ctx->sw_format != pix_fmt) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "JVID CUDA decode requires a CUDA hw_frames_ctx matching sw_format %s.\n",
+                   av_get_pix_fmt_name(pix_fmt));
+            return AVERROR(EINVAL);
+        }
+
+        sw_frame = av_frame_alloc();
+        if (!sw_frame)
+            return AVERROR(ENOMEM);
+        sw_frame->format = pix_fmt;
+        sw_frame->width  = hdr.width;
+        sw_frame->height = hdr.height;
+
+        ret = av_frame_get_buffer(sw_frame, 0);
+        if (ret < 0)
+            goto fail;
+
+        avctx->sw_pix_fmt = pix_fmt;
+        avctx->pix_fmt    = AV_PIX_FMT_CUDA;
+        dst_frame         = sw_frame;
+    } else {
+        avctx->pix_fmt = pix_fmt;
+        ret = ff_get_buffer(avctx, frame, 0);
+        if (ret < 0)
+            return ret;
+    }
 
     src = avpkt->data + hdr.header_size;
     if (hdr.flags & JVID_FLAG_DEFLATE) {
@@ -396,20 +427,20 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     if (hdr.frame_type == JVID_FRAME_BLOCK_I420) {
-        ret = jvid_decode_block_frame(avctx, s, frame, &hdr, src, compressed_size);
+        ret = jvid_decode_block_frame(avctx, s, dst_frame, &hdr, src, compressed_size);
         if (ret < 0)
-            return ret;
+            goto fail;
     } else {
         if (!(hdr.flags & JVID_FLAG_DEFLATE) && compressed_size < payload_size)
-            return AVERROR_INVALIDDATA;
+            goto fail_invalid;
 
         ret = av_image_fill_linesizes(src_linesize, pix_fmt, hdr.width);
         if (ret < 0)
-            return ret;
+            goto fail;
         ret = av_image_fill_pointers(src_data, pix_fmt, hdr.height, src, src_linesize);
         if (ret < 0)
-            return ret;
-        av_image_copy(frame->data, frame->linesize,
+            goto fail;
+        av_image_copy(dst_frame->data, dst_frame->linesize,
                       (const uint8_t * const *)src_data, src_linesize,
                       pix_fmt, hdr.width, hdr.height);
 
@@ -422,19 +453,37 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             ret = jvid_ensure_buffer(&s->prev_frame, &s->prev_frame_alloc,
                                      y_size + 2 * uv_size);
             if (ret < 0)
-                return ret;
+                goto fail;
 
             jvid_store_prev_block(s->prev_frame, 0, hdr.width,
-                                  frame->data[0], frame->linesize[0],
+                                  dst_frame->data[0], dst_frame->linesize[0],
                                   0, 0, hdr.width, hdr.height);
             jvid_store_prev_block(s->prev_frame, y_size, uv_w,
-                                  frame->data[1], frame->linesize[1],
+                                  dst_frame->data[1], dst_frame->linesize[1],
                                   0, 0, uv_w, uv_h);
             jvid_store_prev_block(s->prev_frame, y_size + uv_size, uv_w,
-                                  frame->data[2], frame->linesize[2],
+                                  dst_frame->data[2], dst_frame->linesize[2],
                                   0, 0, uv_w, uv_h);
             s->has_prev_frame = 1;
         }
+    }
+
+    if (sw_frame) {
+        ret = av_hwframe_get_buffer(avctx->hw_frames_ctx, frame, 0);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to allocate CUDA output frame.\n");
+            goto fail;
+        }
+
+        ret = av_hwframe_transfer_data(frame, sw_frame, 0);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to transfer decoded frame to CUDA memory.\n");
+            goto fail;
+        }
+
+        frame->width  = sw_frame->width;
+        frame->height = sw_frame->height;
+        frame->pts    = avpkt->pts;
     }
 
     frame->pict_type = (avpkt->flags & AV_PKT_FLAG_KEY) ? AV_PICTURE_TYPE_I
@@ -447,7 +496,14 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     s->height  = hdr.height;
 
     *got_frame = 1;
+    av_frame_free(&sw_frame);
     return avpkt->size;
+
+fail_invalid:
+    ret = AVERROR_INVALIDDATA;
+fail:
+    av_frame_free(&sw_frame);
+    return ret;
 }
 
 const FFCodec ff_jvid_decoder = {

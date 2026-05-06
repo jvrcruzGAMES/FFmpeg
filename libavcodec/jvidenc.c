@@ -31,6 +31,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/hwcontext.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
@@ -245,9 +246,34 @@ static av_cold int jvid_encode_init(AVCodecContext *avctx)
 
     ret = av_image_check_size2(avctx->width, avctx->height,
                                avctx->max_pixels ? avctx->max_pixels : INT64_MAX,
-                               avctx->pix_fmt, 0, avctx);
+                               avctx->sw_pix_fmt != AV_PIX_FMT_NONE ? avctx->sw_pix_fmt : avctx->pix_fmt,
+                               0, avctx);
     if (ret < 0)
         return ret;
+
+    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+        AVHWFramesContext *frames_ctx;
+
+        if (!avctx->hw_frames_ctx) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "JVID CUDA encode requires hw_frames_ctx.\n");
+            return AVERROR(EINVAL);
+        }
+
+        frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
+        if (frames_ctx->format != AV_PIX_FMT_CUDA ||
+            frames_ctx->sw_format != AV_PIX_FMT_YUV420P) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "JVID CUDA encode supports CUDA frames backed by YUV420P only.\n");
+            return AVERROR(EINVAL);
+        }
+
+        avctx->sw_pix_fmt = AV_PIX_FMT_YUV420P;
+    } else if (avctx->pix_fmt != AV_PIX_FMT_YUV420P) {
+        av_log(avctx, AV_LOG_ERROR,
+               "JVID encodes YUV420P or CUDA(YUV420P) video only.\n");
+        return AVERROR(EINVAL);
+    }
 
     if (s->block_size < 1 || s->block_size > 255 ||
         s->quant_shift < 0 || s->quant_shift > 7 ||
@@ -285,12 +311,14 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 {
     JVIDEncContext *s = avctx->priv_data;
     z_stream *zstream = &s->zstream.zstream;
+    const AVFrame *src_frame = frame;
     int y_size, uv_w, uv_h, uv_size, payload_size, packet_size;
     int y_stride, uv_stride, have_prev;
     uint8_t *payload, *payload_end;
     uint8_t *recon, *scratch;
     int used_skip = 0;
     int zret, ret;
+    AVFrame *sw_frame = NULL;
 
     if (!frame) {
         av_log(avctx, AV_LOG_DEBUG, "JVID flush frame\n");
@@ -298,21 +326,49 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return 0;
     }
 
+    if (frame->format == AV_PIX_FMT_CUDA) {
+        sw_frame = av_frame_alloc();
+        if (!sw_frame)
+            return AVERROR(ENOMEM);
+
+        sw_frame->format = AV_PIX_FMT_YUV420P;
+        sw_frame->width  = frame->width;
+        sw_frame->height = frame->height;
+        sw_frame->pts    = frame->pts;
+
+        ret = av_frame_get_buffer(sw_frame, 0);
+        if (ret < 0)
+            goto fail;
+
+        ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to transfer CUDA frame to system memory.\n");
+            goto fail;
+        }
+
+        src_frame = sw_frame;
+    }
+
     av_log(avctx, AV_LOG_DEBUG,
            "JVID encode frame %dx%d format=%d linesize=%d pts=%s\n",
-           frame->width, frame->height, frame->format, frame->linesize[0],
-           av_ts2str(frame->pts));
+           src_frame->width, src_frame->height, src_frame->format, src_frame->linesize[0],
+           av_ts2str(src_frame->pts));
 
-    if (frame->format != AV_PIX_FMT_YUV420P) {
+    if (src_frame->format != AV_PIX_FMT_YUV420P) {
         av_log(avctx, AV_LOG_ERROR,
                "JVID encodes color video as YUV420P only.\n");
-        return AVERROR(EINVAL);
+        ret = AVERROR(EINVAL);
+        goto fail;
     }
-    if (frame->width != avctx->width || frame->height != avctx->height)
-        return AVERROR(EINVAL);
-    if (!frame->data[0] || !frame->data[1] || !frame->data[2] ||
-        frame->linesize[0] <= 0 || frame->linesize[1] <= 0 || frame->linesize[2] <= 0)
-        return AVERROR(EINVAL);
+    if (src_frame->width != avctx->width || src_frame->height != avctx->height) {
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
+    if (!src_frame->data[0] || !src_frame->data[1] || !src_frame->data[2] ||
+        src_frame->linesize[0] <= 0 || src_frame->linesize[1] <= 0 || src_frame->linesize[2] <= 0) {
+        ret = AVERROR(EINVAL);
+        goto fail;
+    }
 
     y_size = avctx->width * avctx->height;
     uv_w = AV_CEIL_RSHIFT(avctx->width, 1);
@@ -346,24 +402,24 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     payload[3] = 0;
     payload += 4;
 
-    ret = jvid_encode_plane(s, frame->data[0], frame->linesize[0], 0,
+    ret = jvid_encode_plane(s, src_frame->data[0], src_frame->linesize[0], 0,
                             avctx->width, avctx->height, y_stride,
                             &payload, payload_end - (s->block_size * s->block_size * 3),
                             have_prev, scratch, recon, &used_skip);
     if (ret < 0)
-        return ret;
-    ret = jvid_encode_plane(s, frame->data[1], frame->linesize[1], y_size,
+        goto fail;
+    ret = jvid_encode_plane(s, src_frame->data[1], src_frame->linesize[1], y_size,
                             uv_w, uv_h, uv_stride,
                             &payload, payload_end - (s->block_size * s->block_size * 3),
                             have_prev, scratch, recon, &used_skip);
     if (ret < 0)
-        return ret;
-    ret = jvid_encode_plane(s, frame->data[2], frame->linesize[2], y_size + uv_size,
+        goto fail;
+    ret = jvid_encode_plane(s, src_frame->data[2], src_frame->linesize[2], y_size + uv_size,
                             uv_w, uv_h, uv_stride,
                             &payload, payload_end - (s->block_size * s->block_size * 3),
                             have_prev, scratch, recon, &used_skip);
     if (ret < 0)
-        return ret;
+        goto fail;
 
     payload_size = payload - s->payload;
     packet_size = deflateBound(zstream, payload_size);
@@ -410,7 +466,12 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     av_log(avctx, AV_LOG_DEBUG, "JVID produced packet size=%d payload=%d\n",
            pkt->size, payload_size);
+    av_frame_free(&sw_frame);
     return 0;
+
+fail:
+    av_frame_free(&sw_frame);
+    return ret;
 }
 
 #define OFFSET(x) offsetof(JVIDEncContext, x)
@@ -441,6 +502,6 @@ const FFCodec ff_jvid_encoder = {
     .init           = jvid_encode_init,
     .close          = jvid_encode_close,
     FF_CODEC_ENCODE_CB(jvid_encode_frame),
-    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA),
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };
