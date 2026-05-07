@@ -34,6 +34,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "hwconfig.h"
 #include "zlib_wrapper.h"
 
 #define JVID_MIN_HEADER_SIZE    12
@@ -373,10 +374,11 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     if (avctx->hw_frames_ctx) {
         frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
-        if (frames_ctx->format != AV_PIX_FMT_CUDA ||
+        if ((frames_ctx->format != AV_PIX_FMT_CUDA &&
+             frames_ctx->format != AV_PIX_FMT_VIDEOTOOLBOX) ||
             frames_ctx->sw_format != pix_fmt) {
             av_log(avctx, AV_LOG_ERROR,
-                   "JVID CUDA decode requires a CUDA hw_frames_ctx matching sw_format %s.\n",
+                   "JVID hardware decode requires a CUDA or VideoToolbox hw_frames_ctx matching sw_format %s.\n",
                    av_get_pix_fmt_name(pix_fmt));
             return AVERROR(EINVAL);
         }
@@ -393,7 +395,7 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             goto fail;
 
         avctx->sw_pix_fmt = pix_fmt;
-        avctx->pix_fmt    = AV_PIX_FMT_CUDA;
+        avctx->pix_fmt    = frames_ctx->format;
         dst_frame         = sw_frame;
     } else {
         avctx->pix_fmt = pix_fmt;
@@ -471,13 +473,13 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (sw_frame) {
         ret = av_hwframe_get_buffer(avctx->hw_frames_ctx, frame, 0);
         if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to allocate CUDA output frame.\n");
+            av_log(avctx, AV_LOG_ERROR, "Failed to allocate hardware output frame.\n");
             goto fail;
         }
 
         ret = av_hwframe_transfer_data(frame, sw_frame, 0);
         if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to transfer decoded frame to CUDA memory.\n");
+            av_log(avctx, AV_LOG_ERROR, "Failed to transfer decoded frame to hardware memory.\n");
             goto fail;
         }
 
@@ -516,5 +518,10 @@ const FFCodec ff_jvid_decoder = {
     .close          = jvid_decode_close,
     FF_CODEC_DECODE_CB(jvid_decode_frame),
     .p.capabilities = AV_CODEC_CAP_DR1,
+    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+        HW_CONFIG_ENCODER_FRAMES(CUDA, CUDA),
+        HW_CONFIG_ENCODER_FRAMES(VIDEOTOOLBOX, VIDEOTOOLBOX),
+        NULL
+    },
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

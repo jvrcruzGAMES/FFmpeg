@@ -36,6 +36,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "encode.h"
+#include "hwconfig.h"
 #include "zlib_wrapper.h"
 
 #define JVID_HEADER_SIZE         16
@@ -252,27 +253,28 @@ static av_cold int jvid_encode_init(AVCodecContext *avctx)
     if (ret < 0)
         return ret;
 
-    if (avctx->pix_fmt == AV_PIX_FMT_CUDA) {
+    if (avctx->pix_fmt == AV_PIX_FMT_CUDA ||
+        avctx->pix_fmt == AV_PIX_FMT_VIDEOTOOLBOX) {
         AVHWFramesContext *frames_ctx;
 
         if (!avctx->hw_frames_ctx) {
             av_log(avctx, AV_LOG_ERROR,
-                   "JVID CUDA encode requires hw_frames_ctx.\n");
+                   "JVID hardware encode requires hw_frames_ctx.\n");
             return AVERROR(EINVAL);
         }
 
         frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
-        if (frames_ctx->format != AV_PIX_FMT_CUDA ||
+        if (frames_ctx->format != avctx->pix_fmt ||
             frames_ctx->sw_format != AV_PIX_FMT_YUV420P) {
             av_log(avctx, AV_LOG_ERROR,
-                   "JVID CUDA encode supports CUDA frames backed by YUV420P only.\n");
+                   "JVID hardware encode supports frames backed by YUV420P only.\n");
             return AVERROR(EINVAL);
         }
 
         avctx->sw_pix_fmt = AV_PIX_FMT_YUV420P;
     } else if (avctx->pix_fmt != AV_PIX_FMT_YUV420P) {
         av_log(avctx, AV_LOG_ERROR,
-               "JVID encodes YUV420P or CUDA(YUV420P) video only.\n");
+               "JVID encodes YUV420P, CUDA(YUV420P), or VideoToolbox(YUV420P) video only.\n");
         return AVERROR(EINVAL);
     }
 
@@ -327,7 +329,8 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return 0;
     }
 
-    if (frame->format == AV_PIX_FMT_CUDA) {
+    if (frame->format == AV_PIX_FMT_CUDA ||
+        frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
         sw_frame = av_frame_alloc();
         if (!sw_frame)
             return AVERROR(ENOMEM);
@@ -343,7 +346,7 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
         ret = av_hwframe_transfer_data(sw_frame, frame, 0);
         if (ret < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to transfer CUDA frame to system memory.\n");
+            av_log(avctx, AV_LOG_ERROR, "Failed to transfer hardware frame to system memory.\n");
             goto fail;
         }
 
@@ -503,6 +506,11 @@ const FFCodec ff_jvid_encoder = {
     .init           = jvid_encode_init,
     .close          = jvid_encode_close,
     FF_CODEC_ENCODE_CB(jvid_encode_frame),
-    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA),
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P, AV_PIX_FMT_CUDA, AV_PIX_FMT_VIDEOTOOLBOX),
+    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+        HW_CONFIG_ENCODER_FRAMES(CUDA, CUDA),
+        HW_CONFIG_ENCODER_FRAMES(VIDEOTOOLBOX, VIDEOTOOLBOX),
+        NULL
+    },
     .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

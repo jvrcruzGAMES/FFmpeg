@@ -43,6 +43,7 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/timestamp.h"
 
@@ -83,6 +84,14 @@ enum JMOVPacketFlags {
 typedef struct JMOVMuxContext {
     int wrote_data_chunk;
 } JMOVMuxContext;
+
+typedef struct JMOVPacketStats {
+    int seen;
+    int64_t first_ts;
+    int64_t end_ts;
+    int64_t payload_size;
+    int64_t packets;
+} JMOVPacketStats;
 
 static int jmov_media_type_from_codecpar(const AVCodecParameters *par)
 {
@@ -484,6 +493,7 @@ end:
 static int jmov_read_header(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
+    int64_t data_offset;
 
     if (avio_rl32(pb) != JMOV_MAGIC)
         return AVERROR_INVALIDDATA;
@@ -517,7 +527,103 @@ static int jmov_read_header(AVFormatContext *s)
         }
         case JMOV_TAG_DATA:
             avio_skip(pb, size);
-            ffformatcontext(s)->data_offset = avio_tell(pb);
+            data_offset = avio_tell(pb);
+            ffformatcontext(s)->data_offset = data_offset;
+            if (s->nb_streams && (pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+                JMOVPacketStats *stats = av_calloc(s->nb_streams, sizeof(*stats));
+                int64_t max_duration = AV_NOPTS_VALUE;
+                int64_t file_size;
+
+                if (!stats)
+                    return AVERROR(ENOMEM);
+
+                while (!avio_feof(pb)) {
+                    uint32_t pkt_tag  = avio_rl32(pb);
+                    uint32_t pkt_size = avio_rl32(pb);
+
+                    if (avio_feof(pb))
+                        break;
+
+                    if (pkt_tag == JMOV_TAG_PKT0) {
+                        uint32_t payload_size;
+                        uint32_t duration;
+                        uint32_t stream_index;
+                        int64_t pts, dts, ts, end_ts;
+
+                        if (pkt_size < JMOV_PACKET_DESC_SIZE) {
+                            av_free(stats);
+                            return AVERROR_INVALIDDATA;
+                        }
+
+                        stream_index = avio_r8(pb);
+                        avio_skip(pb, 3);
+                        pts          = (int64_t)avio_rl64(pb);
+                        dts          = (int64_t)avio_rl64(pb);
+                        duration     = avio_rl32(pb);
+                        payload_size = avio_rl32(pb);
+
+                        if (payload_size != pkt_size - JMOV_PACKET_DESC_SIZE ||
+                            stream_index >= s->nb_streams) {
+                            av_free(stats);
+                            return AVERROR_INVALIDDATA;
+                        }
+
+                        ts = pts != AV_NOPTS_VALUE ? pts : dts;
+                        if (ts != AV_NOPTS_VALUE) {
+                            JMOVPacketStats *st_stats = &stats[stream_index];
+
+                            end_ts = duration ? ts + duration : ts;
+                            if (!st_stats->seen || ts < st_stats->first_ts)
+                                st_stats->first_ts = ts;
+                            if (!st_stats->seen || end_ts > st_stats->end_ts)
+                                st_stats->end_ts = end_ts;
+                            st_stats->seen = 1;
+                        }
+                        stats[stream_index].payload_size += payload_size;
+                        stats[stream_index].packets++;
+                        avio_skip(pb, payload_size);
+                    } else if (pkt_tag == JMOV_TAG_DONE) {
+                        avio_skip(pb, pkt_size);
+                        break;
+                    } else {
+                        avio_skip(pb, pkt_size);
+                    }
+                }
+
+                for (unsigned i = 0; i < s->nb_streams; i++) {
+                    AVStream *st = s->streams[i];
+                    JMOVPacketStats *st_stats = &stats[i];
+
+                    if (st_stats->seen && st_stats->end_ts >= st_stats->first_ts) {
+                        int64_t duration = st_stats->end_ts - st_stats->first_ts;
+
+                        st->start_time = st_stats->first_ts;
+                        st->duration   = duration;
+                        if (duration > 0 && st_stats->payload_size > 0 &&
+                            st->codecpar->bit_rate <= 0)
+                            st->codecpar->bit_rate = av_rescale_q(st_stats->payload_size,
+                                                                  (AVRational){ 8 * st->time_base.den,
+                                                                                st->time_base.num },
+                                                                  (AVRational){ duration, 1 });
+                        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                            st->nb_frames = st_stats->packets;
+
+                        duration = av_rescale_q(duration, st->time_base, AV_TIME_BASE_Q);
+                        if (max_duration == AV_NOPTS_VALUE || duration > max_duration)
+                            max_duration = duration;
+                    }
+                }
+
+                if (max_duration != AV_NOPTS_VALUE)
+                    s->duration = max_duration;
+                file_size = avio_size(pb);
+                if (s->duration > 0 && file_size > 0)
+                    s->bit_rate = av_rescale(file_size, 8 * AV_TIME_BASE, s->duration);
+
+                av_free(stats);
+                if (avio_seek(pb, data_offset, SEEK_SET) < 0)
+                    return AVERROR(EIO);
+            }
             return 0;
         default:
             avio_skip(pb, size);
