@@ -180,11 +180,92 @@ static void jvid_store_prev_block(uint8_t *prev, int plane_offset, int plane_str
                src + (y0 + y) * src_linesize + x0, bw);
 }
 
+static int jvid_skip_plane_blocks(uint8_t **psrc, const uint8_t *src_end,
+                                  int plane_w, int plane_h, int block_size,
+                                  int *used_skip)
+{
+    uint8_t *src = *psrc;
+
+    for (int y0 = 0; y0 < plane_h; y0 += block_size) {
+        int bh = FFMIN(block_size, plane_h - y0);
+
+        for (int x0 = 0; x0 < plane_w; x0 += block_size) {
+            int bw = FFMIN(block_size, plane_w - x0);
+            int pixels = bw * bh;
+            int tag;
+
+            if (src >= src_end)
+                return AVERROR_INVALIDDATA;
+
+            tag = *src++;
+            switch (tag) {
+            case JVID_BLOCK_SKIP:
+                *used_skip = 1;
+                break;
+            case JVID_BLOCK_RAW:
+                if (src_end - src < pixels)
+                    return AVERROR_INVALIDDATA;
+                src += pixels;
+                break;
+            case JVID_BLOCK_RLE: {
+                int written = 0;
+
+                while (written < pixels) {
+                    uint8_t run;
+
+                    if (src_end - src < 2)
+                        return AVERROR_INVALIDDATA;
+
+                    run = *src++;
+                    src++;
+                    if (!run || written + run > pixels)
+                        return AVERROR_INVALIDDATA;
+                    written += run;
+                }
+                break;
+            }
+            default:
+                return AVERROR_INVALIDDATA;
+            }
+        }
+    }
+
+    *psrc = src;
+    return 0;
+}
+
+static int jvid_block_frame_uses_skip(const JVIDHeader *hdr,
+                                      const uint8_t *src, int payload_size,
+                                      int *used_skip)
+{
+    int uv_w = AV_CEIL_RSHIFT(hdr->width, 1);
+    int uv_h = AV_CEIL_RSHIFT(hdr->height, 1);
+    uint8_t *mutable_src = (uint8_t *)src;
+    const uint8_t *src_end = src + payload_size;
+    int ret;
+
+    *used_skip = 0;
+    if (payload_size < 4)
+        return AVERROR_INVALIDDATA;
+
+    mutable_src += 4;
+    ret = jvid_skip_plane_blocks(&mutable_src, src_end, hdr->width, hdr->height,
+                                 hdr->block_size, used_skip);
+    if (ret < 0 || *used_skip)
+        return ret;
+    ret = jvid_skip_plane_blocks(&mutable_src, src_end, uv_w, uv_h,
+                                 hdr->block_size, used_skip);
+    if (ret < 0 || *used_skip)
+        return ret;
+    return jvid_skip_plane_blocks(&mutable_src, src_end, uv_w, uv_h,
+                                  hdr->block_size, used_skip);
+}
+
 static int jvid_decode_plane_blocks(AVCodecContext *avctx, JVIDContext *s,
                                     uint8_t **psrc, const uint8_t *src_end,
                                     uint8_t *dst, ptrdiff_t dst_linesize,
                                     int plane_offset, int plane_w, int plane_h,
-                                    int plane_stride, int block_size, int have_prev)
+                                    int plane_stride, int block_size)
 {
     uint8_t *src = *psrc;
 
@@ -203,11 +284,6 @@ static int jvid_decode_plane_blocks(AVCodecContext *avctx, JVIDContext *s,
             switch (tag) {
             case JVID_BLOCK_SKIP: {
                 int ret;
-
-                if (!have_prev) {
-                    av_log(avctx, AV_LOG_ERROR, "JVID skip block without reference frame.\n");
-                    return AVERROR_INVALIDDATA;
-                }
 
                 ret = jvid_copy_prev_block(dst, dst_linesize, s->prev_frame,
                                            plane_offset, plane_stride,
@@ -268,9 +344,6 @@ static int jvid_decode_block_frame(AVCodecContext *avctx, JVIDContext *s,
     int uv_h = AV_CEIL_RSHIFT(hdr->height, 1);
     int uv_size = uv_w * uv_h;
     int frame_size = y_size + 2 * uv_size;
-    int have_prev = s->has_prev_frame &&
-                    s->width == hdr->width && s->height == hdr->height &&
-                    s->prev_frame;
     uint8_t *mutable_src = (uint8_t *)src;
     const uint8_t *src_end = src + payload_size;
     int ret;
@@ -286,19 +359,19 @@ static int jvid_decode_block_frame(AVCodecContext *avctx, JVIDContext *s,
     ret = jvid_decode_plane_blocks(avctx, s, &mutable_src, src_end,
                                    frame->data[0], frame->linesize[0],
                                    0, hdr->width, hdr->height,
-                                   hdr->width, hdr->block_size, have_prev);
+                                   hdr->width, hdr->block_size);
     if (ret < 0)
         return ret;
     ret = jvid_decode_plane_blocks(avctx, s, &mutable_src, src_end,
                                    frame->data[1], frame->linesize[1],
                                    y_size, uv_w, uv_h,
-                                   uv_w, hdr->block_size, have_prev);
+                                   uv_w, hdr->block_size);
     if (ret < 0)
         return ret;
     ret = jvid_decode_plane_blocks(avctx, s, &mutable_src, src_end,
                                    frame->data[2], frame->linesize[2],
                                    y_size + uv_size, uv_w, uv_h,
-                                   uv_w, hdr->block_size, have_prev);
+                                   uv_w, hdr->block_size);
     if (ret < 0)
         return ret;
 
@@ -330,6 +403,7 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     AVFrame *sw_frame = NULL;
     AVFrame *dst_frame = frame;
     enum AVPixelFormat pix_fmt;
+    enum AVPixelFormat storage_pix_fmt;
     uint8_t *src_data[4] = { 0 };
     int src_linesize[4] = { 0 };
     int payload_size;
@@ -348,13 +422,16 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         break;
     case JVID_FRAME_RAW_I420:
     case JVID_FRAME_BLOCK_I420:
-        pix_fmt = AV_PIX_FMT_YUV420P;
+        pix_fmt = AV_PIX_FMT_YUVJ420P;
         break;
     default:
         av_log(avctx, AV_LOG_ERROR,
                "Unsupported JVID frame type %u.\n", hdr.frame_type);
         return AVERROR_PATCHWELCOME;
     }
+    avctx->color_range = AVCOL_RANGE_JPEG;
+    storage_pix_fmt = pix_fmt == AV_PIX_FMT_YUVJ420P ? AV_PIX_FMT_YUV420P :
+                                                    pix_fmt;
 
     ret = ff_set_dimensions(avctx, hdr.width, hdr.height);
     if (ret < 0)
@@ -365,7 +442,7 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         return AVERROR_INVALIDDATA;
     }
 
-    payload_size = av_image_get_buffer_size(pix_fmt, hdr.width, hdr.height, 1);
+    payload_size = av_image_get_buffer_size(storage_pix_fmt, hdr.width, hdr.height, 1);
     if (payload_size < 0)
         return payload_size;
     compressed_size = avpkt->size - hdr.header_size;
@@ -376,17 +453,17 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         frames_ctx = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
         if ((frames_ctx->format != AV_PIX_FMT_CUDA &&
              frames_ctx->format != AV_PIX_FMT_VIDEOTOOLBOX) ||
-            frames_ctx->sw_format != pix_fmt) {
+            frames_ctx->sw_format != storage_pix_fmt) {
             av_log(avctx, AV_LOG_ERROR,
                    "JVID hardware decode requires a CUDA or VideoToolbox hw_frames_ctx matching sw_format %s.\n",
-                   av_get_pix_fmt_name(pix_fmt));
+                   av_get_pix_fmt_name(storage_pix_fmt));
             return AVERROR(EINVAL);
         }
 
         sw_frame = av_frame_alloc();
         if (!sw_frame)
             return AVERROR(ENOMEM);
-        sw_frame->format = pix_fmt;
+        sw_frame->format = storage_pix_fmt;
         sw_frame->width  = hdr.width;
         sw_frame->height = hdr.height;
 
@@ -394,7 +471,7 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         if (ret < 0)
             goto fail;
 
-        avctx->sw_pix_fmt = pix_fmt;
+        avctx->sw_pix_fmt = storage_pix_fmt;
         avctx->pix_fmt    = frames_ctx->format;
         dst_frame         = sw_frame;
     } else {
@@ -429,6 +506,25 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     if (hdr.frame_type == JVID_FRAME_BLOCK_I420) {
+        int have_prev = s->has_prev_frame &&
+                        s->width == hdr.width && s->height == hdr.height &&
+                        s->prev_frame;
+        int used_skip;
+
+        if (!have_prev) {
+            ret = jvid_block_frame_uses_skip(&hdr, src, compressed_size, &used_skip);
+            if (ret < 0)
+                goto fail;
+            if (used_skip) {
+                av_log(avctx, AV_LOG_DEBUG,
+                       "Skipping JVID block frame without reference frame.\n");
+                av_frame_unref(frame);
+                av_frame_free(&sw_frame);
+                *got_frame = 0;
+                return avpkt->size;
+            }
+        }
+
         ret = jvid_decode_block_frame(avctx, s, dst_frame, &hdr, src, compressed_size);
         if (ret < 0)
             goto fail;
@@ -436,15 +532,16 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         if (!(hdr.flags & JVID_FLAG_DEFLATE) && compressed_size < payload_size)
             goto fail_invalid;
 
-        ret = av_image_fill_linesizes(src_linesize, pix_fmt, hdr.width);
+        ret = av_image_fill_linesizes(src_linesize, storage_pix_fmt, hdr.width);
         if (ret < 0)
             goto fail;
-        ret = av_image_fill_pointers(src_data, pix_fmt, hdr.height, src, src_linesize);
+        ret = av_image_fill_pointers(src_data, storage_pix_fmt, hdr.height,
+                                     (uint8_t *)src, src_linesize);
         if (ret < 0)
             goto fail;
         av_image_copy(dst_frame->data, dst_frame->linesize,
                       (const uint8_t * const *)src_data, src_linesize,
-                      pix_fmt, hdr.width, hdr.height);
+                      storage_pix_fmt, hdr.width, hdr.height);
 
         if (hdr.frame_type == JVID_FRAME_RAW_I420) {
             int y_size = hdr.width * hdr.height;
@@ -487,6 +584,7 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         frame->height = sw_frame->height;
         frame->pts    = avpkt->pts;
     }
+    frame->color_range = AVCOL_RANGE_JPEG;
 
     frame->pict_type = (avpkt->flags & AV_PKT_FLAG_KEY) ? AV_PICTURE_TYPE_I
                                                         : AV_PICTURE_TYPE_P;

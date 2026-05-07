@@ -445,6 +445,10 @@ static int jmov_parse_stream(AVFormatContext *s, uint32_t size)
     if (size > desc_size + extradata_size)
         avio_skip(s->pb, size - desc_size - extradata_size);
 
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO &&
+        par->codec_id == AV_CODEC_ID_JVID)
+        par->color_range = AVCOL_RANGE_JPEG;
+
     return 0;
 }
 
@@ -540,6 +544,7 @@ static int jmov_read_header(AVFormatContext *s)
                 while (!avio_feof(pb)) {
                     uint32_t pkt_tag  = avio_rl32(pb);
                     uint32_t pkt_size = avio_rl32(pb);
+                    int64_t pkt_pos = avio_tell(pb) - 8;
 
                     if (avio_feof(pb))
                         break;
@@ -548,6 +553,7 @@ static int jmov_read_header(AVFormatContext *s)
                         uint32_t payload_size;
                         uint32_t duration;
                         uint32_t stream_index;
+                        uint8_t flags;
                         int64_t pts, dts, ts, end_ts;
 
                         if (pkt_size < JMOV_PACKET_DESC_SIZE) {
@@ -556,7 +562,8 @@ static int jmov_read_header(AVFormatContext *s)
                         }
 
                         stream_index = avio_r8(pb);
-                        avio_skip(pb, 3);
+                        flags        = avio_r8(pb);
+                        avio_skip(pb, 2);
                         pts          = (int64_t)avio_rl64(pb);
                         dts          = (int64_t)avio_rl64(pb);
                         duration     = avio_rl32(pb);
@@ -570,9 +577,14 @@ static int jmov_read_header(AVFormatContext *s)
 
                         ts = pts != AV_NOPTS_VALUE ? pts : dts;
                         if (ts != AV_NOPTS_VALUE) {
+                            AVStream *st = s->streams[stream_index];
                             JMOVPacketStats *st_stats = &stats[stream_index];
+                            int index_flags = flags & JMOV_PKT_FLAG_KEY ?
+                                              AVINDEX_KEYFRAME : 0;
 
                             end_ts = duration ? ts + duration : ts;
+                            av_add_index_entry(st, pkt_pos, ts,
+                                               pkt_size + 8, 0, index_flags);
                             if (!st_stats->seen || ts < st_stats->first_ts)
                                 st_stats->first_ts = ts;
                             if (!st_stats->seen || end_ts > st_stats->end_ts)
@@ -694,6 +706,56 @@ static int jmov_read_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
+static int jmov_read_seek(AVFormatContext *s, int stream_index,
+                          int64_t timestamp, int flags)
+{
+    AVStream *st;
+    int index;
+    int64_t ret;
+
+    if (flags & (AVSEEK_FLAG_BYTE | AVSEEK_FLAG_FRAME))
+        return AVERROR(ENOSYS);
+
+    if (stream_index < 0) {
+        stream_index = av_find_best_stream(s, AVMEDIA_TYPE_VIDEO, -1, -1,
+                                           NULL, 0);
+        if (stream_index < 0)
+            stream_index = 0;
+    }
+    if (stream_index >= s->nb_streams)
+        return AVERROR(EINVAL);
+
+    st = s->streams[stream_index];
+    if (st->codecpar->codec_id == AV_CODEC_ID_JVID &&
+        ffstream(st)->nb_index_entries > 1) {
+        int all_key = 1;
+
+        for (int i = 0; i < ffstream(st)->nb_index_entries; i++) {
+            if (!(ffstream(st)->index_entries[i].flags & AVINDEX_KEYFRAME)) {
+                all_key = 0;
+                break;
+            }
+        }
+        index = all_key ? 0 : -1;
+    } else {
+        index = -1;
+    }
+
+    if (index < 0) {
+        index = av_index_search_timestamp(st, timestamp,
+                                          flags | AVSEEK_FLAG_BACKWARD);
+        if (index < 0)
+            index = av_index_search_timestamp(st, timestamp,
+                                              flags | AVSEEK_FLAG_BACKWARD |
+                                              AVSEEK_FLAG_ANY);
+    }
+    if (index < 0)
+        return index;
+
+    ret = avio_seek(s->pb, ffstream(st)->index_entries[index].pos, SEEK_SET);
+    return ret < 0 ? ret : 0;
+}
+
 const FFInputFormat ff_jmov_demuxer = {
     .p.name         = "jmov",
     .p.long_name    = NULL_IF_CONFIG_SMALL("JMOV container"),
@@ -702,6 +764,7 @@ const FFInputFormat ff_jmov_demuxer = {
     .read_probe     = jmov_probe,
     .read_header    = jmov_read_header,
     .read_packet    = jmov_read_packet,
+    .read_seek      = jmov_read_seek,
 };
 
 const FFOutputFormat ff_jmov_muxer = {

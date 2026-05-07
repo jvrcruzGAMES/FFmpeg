@@ -2014,7 +2014,7 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_VIDEO,
         .name      = "jvid",
         .long_name = NULL_IF_CONFIG_SMALL("JVID video"),
-        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSLESS,
+        .props     = AV_CODEC_PROP_LOSSLESS,
     },
 
     /* various PCM "codecs" */
