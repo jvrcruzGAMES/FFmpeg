@@ -68,16 +68,31 @@ min_version_flag() {
     esac
 }
 
+target_triple() {
+    local sdk="$1"
+    local arch="$2"
+
+    case "$sdk" in
+        iphoneos) echo "$arch-apple-ios$MIN_IOS" ;;
+        iphonesimulator) echo "$arch-apple-ios$MIN_IOS-simulator" ;;
+        *) die "unknown SDK: $sdk" ;;
+    esac
+}
+
 build_one() {
     local sdk="$1"
     local arch="$2"
     local sdk_path
     local min_flag
+    local target
     local prefix
+    local cc
 
     sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
     min_flag="$(min_version_flag "$sdk")"
+    target="$(target_triple "$sdk" "$arch")"
     prefix="$BUILD_ROOT/$sdk-$arch"
+    cc="$(xcrun --sdk "$sdk" -f clang) -target $target"
 
     echo
     echo "==> Building FFmpeg for $sdk $arch"
@@ -89,13 +104,13 @@ build_one() {
     ./configure \
         --prefix="$prefix" \
         --arch="$arch" \
-        --cc="$(xcrun --sdk "$sdk" -f clang)" \
+        --cc="$cc" \
         --ar="$(xcrun --sdk "$sdk" -f ar)" \
         --ranlib="$(xcrun --sdk "$sdk" -f ranlib)" \
         --strip="$(xcrun --sdk "$sdk" -f strip)" \
         --sysroot="$sdk_path" \
-        --extra-cflags="-arch $arch $min_flag -isysroot $sdk_path" \
-        --extra-ldflags="-arch $arch $min_flag -isysroot $sdk_path" \
+        --extra-cflags="-target $target $min_flag -isysroot $sdk_path" \
+        --extra-ldflags="-target $target $min_flag -isysroot $sdk_path" \
         "${COMMON_CONFIGURE_FLAGS[@]}" \
         $EXTRA_CONFIGURE_FLAGS
 
