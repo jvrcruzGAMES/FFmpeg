@@ -1,5 +1,6 @@
 input.mkv
 *.jmov
+build/
 
 *.a
 *.o

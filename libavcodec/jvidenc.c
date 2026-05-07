@@ -49,6 +49,7 @@
 #define JVID_BLOCK_RLE            2
 
 typedef struct JVIDEncContext {
+    const AVClass *class;
     FFZStream zstream;
     uint8_t *payload;
     size_t payload_alloc;
