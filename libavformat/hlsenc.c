@@ -3003,7 +3003,8 @@ static int hls_init(AVFormatContext *s)
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
     } else {
-        pattern = hls->segment_type == SEGMENT_TYPE_FMP4 ? "%d.m4s" : "%d.ts";
+        pattern = hls->segment_type == SEGMENT_TYPE_FMP4 ? "%d.m4s" :
+                  hls->use_jstrm ? "%d.jmov" : "%d.ts";
         if (hls->flags & HLS_SINGLE_FILE)
             pattern += 2;
     }
@@ -3116,8 +3117,17 @@ static int hls_init(AVFormatContext *s)
             return AVERROR_MUXER_NOT_FOUND;
 #endif
         } else {
-            EXTERN const FFOutputFormat ff_mpegts_muxer;
-            vs->oformat = &ff_mpegts_muxer.p;
+            if (hls->use_jstrm) {
+#if CONFIG_JMOV_MUXER
+                EXTERN const FFOutputFormat ff_jmov_muxer;
+                vs->oformat = &ff_jmov_muxer.p;
+#else
+                return AVERROR_MUXER_NOT_FOUND;
+#endif
+            } else {
+                EXTERN const FFOutputFormat ff_mpegts_muxer;
+                vs->oformat = &ff_mpegts_muxer.p;
+            }
         }
 
         if (hls->segment_filename) {
