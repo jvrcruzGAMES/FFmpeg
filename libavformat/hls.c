@@ -233,7 +233,15 @@ typedef struct HLSContext {
     int seg_max_retry;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
+    int is_jstrm;
 } HLSContext;
+
+static int manifest_tag_match(const HLSContext *c, const char *line,
+                              const char *hls_tag, const char *jstrm_tag,
+                              const char **ptr)
+{
+    return av_strstart(line, c->is_jstrm ? jstrm_tag : hls_tag, ptr);
+}
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
 {
@@ -843,7 +851,11 @@ static int parse_playlist(HLSContext *c, const char *url,
         url = new_url;
 
     ff_get_chomp_line(in, line, sizeof(line));
-    if (strcmp(line, "#EXTM3U")) {
+    if (!strcmp(line, "#JSTRM")) {
+        c->is_jstrm = 1;
+    } else if (!strcmp(line, "#EXTM3U")) {
+        c->is_jstrm = 0;
+    } else {
         ret = AVERROR_INVALIDDATA;
         goto fail;
     }
@@ -860,11 +872,11 @@ static int parse_playlist(HLSContext *c, const char *url,
     }
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
-        if (av_strstart(line, "#EXT-X-STREAM-INF:", &ptr)) {
+        if (manifest_tag_match(c, line, "#EXT-X-STREAM-INF:", "#JSTRM-STREAM:", &ptr)) {
             is_variant = 1;
             memset(&variant_info, 0, sizeof(variant_info));
             ff_parse_key_value(ptr, handle_variant_args, &variant_info);
-        } else if (av_strstart(line, "#EXT-X-KEY:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-KEY:", "#JSTRM-KEY:", &ptr)) {
             struct key_info info = {{0}};
             ff_parse_key_value(ptr, handle_key_args, &info);
             key_type = KEY_NONE;
@@ -878,11 +890,11 @@ static int parse_playlist(HLSContext *c, const char *url,
                 has_iv = 1;
             }
             av_strlcpy(key, info.uri, sizeof(key));
-        } else if (av_strstart(line, "#EXT-X-MEDIA:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-MEDIA:", "#JSTRM-MEDIA:", &ptr)) {
             struct rendition_info info = {{0}};
             ff_parse_key_value(ptr, handle_rendition_args, &info);
             new_rendition(c, &info, url);
-        } else if (av_strstart(line, "#EXT-X-TARGETDURATION:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-TARGETDURATION:", "#JSTRM-TARGET:", &ptr)) {
             int64_t t;
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -893,7 +905,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 goto fail;
             }
             pls->target_duration = t * AV_TIME_BASE;
-        } else if (av_strstart(line, "#EXT-X-MEDIA-SEQUENCE:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-MEDIA-SEQUENCE:", "#JSTRM-SEQUENCE:", &ptr)) {
             uint64_t seq_no;
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -905,7 +917,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seq_no &= INT64_MAX/2;
             }
             pls->start_seq_no = seq_no;
-        } else if (av_strstart(line, "#EXT-X-PLAYLIST-TYPE:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-PLAYLIST-TYPE:", "#JSTRM-MODE:", &ptr)) {
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
                 goto fail;
@@ -913,7 +925,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 pls->type = PLS_TYPE_EVENT;
             else if (!strcmp(ptr, "VOD"))
                 pls->type = PLS_TYPE_VOD;
-        } else if (av_strstart(line, "#EXT-X-MAP:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-MAP:", "#JSTRM-INIT:", &ptr)) {
             struct init_section_info info = {{0}};
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -950,7 +962,7 @@ static int parse_playlist(HLSContext *c, const char *url,
                 cur_init_section->key = NULL;
             }
 
-        } else if (av_strstart(line, "#EXT-X-START:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-START:", "#JSTRM-START:", &ptr)) {
             const char *time_offset_value = NULL;
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0) {
@@ -965,10 +977,10 @@ static int parse_playlist(HLSContext *c, const char *url,
                                                 "invalid, it will be ignored");
                 continue;
             }
-        } else if (av_strstart(line, "#EXT-X-ENDLIST", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-ENDLIST", "#JSTRM-END", &ptr)) {
             if (pls)
                 pls->finished = 1;
-        } else if (av_strstart(line, "#EXTINF:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXTINF:", "#JSTRM-SEGMENT:", &ptr)) {
             double d = atof(ptr) * AV_TIME_BASE;
             if (d < 0 || d > INT64_MAX || isnan(d)) {
                 av_log(c->ctx, AV_LOG_WARNING, "EXTINF %f unsupported\n", d / AV_TIME_BASE);
@@ -976,7 +988,7 @@ static int parse_playlist(HLSContext *c, const char *url,
             }
             duration = d;
             is_segment = 1;
-        } else if (av_strstart(line, "#EXT-X-BYTERANGE:", &ptr)) {
+        } else if (manifest_tag_match(c, line, "#EXT-X-BYTERANGE:", "#JSTRM-BYTERANGE:", &ptr)) {
             seg_size = strtoll(ptr, NULL, 10);
             ptr = strchr(ptr, '@');
             if (ptr)
@@ -985,6 +997,12 @@ static int parse_playlist(HLSContext *c, const char *url,
                 ret = AVERROR_INVALIDDATA;
                 goto fail;
             }
+        } else if (manifest_tag_match(c, line, "#EXT-X-DISCONTINUITY", "#JSTRM-BREAK", &ptr) ||
+                   manifest_tag_match(c, line, "#EXT-X-PROGRAM-DATE-TIME:", "#JSTRM-TIME:", &ptr) ||
+                   manifest_tag_match(c, line, "#EXT-X-I-FRAMES-ONLY", "#JSTRM-I-FRAMES", &ptr) ||
+                   manifest_tag_match(c, line, "#EXT-X-INDEPENDENT-SEGMENTS", "#JSTRM-INDEPENDENT", &ptr) ||
+                   manifest_tag_match(c, line, "#EXT-X-ALLOW-CACHE:", "#JSTRM-CACHE:", &ptr)) {
+            continue;
         } else if (av_strstart(line, "#", NULL)) {
             av_log(c->ctx, AV_LOG_VERBOSE, "Skip ('%s')\n", line);
             continue;
@@ -2795,16 +2813,28 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
-static int hls_probe(const AVProbeData *p)
+static int hls_probe_common(const AVProbeData *p, int is_jstrm)
 {
-    /* Require #EXTM3U at the start, and either one of the ones below
-     * somewhere for a proper match. */
-    if (strncmp(p->buf, "#EXTM3U", 7))
+    const char *header = is_jstrm ? "#JSTRM" : "#EXTM3U";
+    const char *tag_stream = is_jstrm ? "#JSTRM-STREAM:" : "#EXT-X-STREAM-INF:";
+    const char *tag_target = is_jstrm ? "#JSTRM-TARGET:" : "#EXT-X-TARGETDURATION:";
+    const char *tag_sequence = is_jstrm ? "#JSTRM-SEQUENCE:" : "#EXT-X-MEDIA-SEQUENCE:";
+    const char *extensions = is_jstrm ? "jstrm" : "m3u8,m3u";
+
+    if (strncmp(p->buf, header, strlen(header)))
         return 0;
 
-    if (strstr(p->buf, "#EXT-X-STREAM-INF:")     ||
-        strstr(p->buf, "#EXT-X-TARGETDURATION:") ||
-        strstr(p->buf, "#EXT-X-MEDIA-SEQUENCE:")) {
+    if (strstr(p->buf, tag_stream) ||
+        strstr(p->buf, tag_target) ||
+        strstr(p->buf, tag_sequence)) {
+        if (is_jstrm) {
+            if (!av_match_ext(p->filename, extensions) &&
+                ff_match_url_ext(p->filename, extensions) <= 0) {
+                av_log(NULL, AV_LOG_ERROR, "Not detecting jstrm with non standard extension\n");
+                return 0;
+            }
+            return AVPROBE_SCORE_MAX;
+        }
 
         int mime_ok = p->mime_type && !(
             av_strcasecmp(p->mime_type, "application/vnd.apple.mpegurl") &&
@@ -2818,8 +2848,8 @@ static int hls_probe(const AVProbeData *p)
 
         if (!mime_ok &&
             !mime_x &&
-            !av_match_ext    (p->filename, "m3u8,m3u") &&
-             ff_match_url_ext(p->filename, "m3u8,m3u") <= 0) {
+            !av_match_ext    (p->filename, extensions) &&
+             ff_match_url_ext(p->filename, extensions) <= 0) {
             av_log(NULL, AV_LOG_ERROR, "Not detecting m3u8/hls with non standard extension and non standard mime type\n");
             return 0;
         }
@@ -2831,6 +2861,16 @@ static int hls_probe(const AVProbeData *p)
     return 0;
 }
 
+static int hls_probe(const AVProbeData *p)
+{
+    return hls_probe_common(p, 0);
+}
+
+static int jstrm_probe(const AVProbeData *p)
+{
+    return hls_probe_common(p, 1);
+}
+
 #define OFFSET(x) offsetof(HLSContext, x)
 #define FLAGS AV_OPT_FLAG_DECODING_PARAM
 static const AVOption hls_options[] = {
@@ -2840,7 +2880,7 @@ static const AVOption hls_options[] = {
         OFFSET(prefer_x_start), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
     {"allowed_extensions", "List of file extensions that hls is allowed to access",
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
-        {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
+        {.str = "3gp,aac,avi,ac3,eac3,flac,jstrm,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
             ",cmfv,cmfa" // Ticket11526 www.nicovideo.jp
             ",ec3"       // part of Ticket11435 (Elisa Viihde (Finnish online recording service))
             ",fmp4"      // https://github.com/yt-dlp/yt-dlp/issues/12700
@@ -2848,7 +2888,7 @@ static const AVOption hls_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     {"allowed_segment_extensions", "List of file extensions that hls is allowed to access",
         OFFSET(allowed_segment_extensions), AV_OPT_TYPE_STRING,
-        {.str = "3gp,aac,avi,ac3,eac3,flac,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
+        {.str = "3gp,aac,avi,ac3,eac3,flac,jstrm,mkv,m3u8,m4a,m4s,m4v,mpg,mov,mp2,mp3,mp4,mpeg,mpegts,ogg,ogv,oga,ts,vob,vtt,wav,webvtt"
             ",cmfv,cmfa" // Ticket11526 www.nicovideo.jp
             ",ec3"       // part of Ticket11435 (Elisa Viihde (Finnish online recording service))
             ",fmp4"      // https://github.com/yt-dlp/yt-dlp/issues/12700
@@ -2889,6 +2929,21 @@ const FFInputFormat ff_hls_demuxer = {
     .priv_data_size = sizeof(HLSContext),
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = hls_probe,
+    .read_header    = hls_read_header,
+    .read_packet    = hls_read_packet,
+    .read_close     = hls_close,
+    .read_seek      = hls_read_seek,
+};
+
+const FFInputFormat ff_jstrm_demuxer = {
+    .p.name         = "jstrm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("JSTRM manifest stream"),
+    .p.extensions   = "jstrm",
+    .p.priv_class   = &hls_class,
+    .p.flags        = AVFMT_NOGENSEARCH | AVFMT_TS_DISCONT | AVFMT_NO_BYTE_SEEK | AVFMT_SHOW_IDS,
+    .priv_data_size = sizeof(HLSContext),
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+    .read_probe     = jstrm_probe,
     .read_header    = hls_read_header,
     .read_packet    = hls_read_packet,
     .read_close     = hls_close,

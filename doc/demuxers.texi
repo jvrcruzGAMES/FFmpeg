@@ -603,6 +603,16 @@ Maximum number of times to reload a segment on error, useful when segment skip o
 Default value is 0.
 @end table
 
+@section jstrm
+
+JSTRM manifest stream demuxer.
+
+This demuxer reads manifests with the @code{.jstrm} extension and the
+@code{#JSTRM} header. It follows the same segmented streaming model as the HLS
+demuxer while using a different manifest vocabulary.
+
+It accepts the same options as the @ref{hls} demuxer.
+
 @section image2
 
 Image file demuxer.

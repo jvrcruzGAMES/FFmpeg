@@ -49,6 +49,7 @@
 #include "http.h"
 #endif
 #include "hlsplaylist.h"
+#include "jstrmplaylist.h"
 #include "internal.h"
 #include "mux.h"
 #include "os_support.h"
@@ -262,7 +263,114 @@ typedef struct HLSContext {
     char *headers;
     int has_default_key; /* has DEFAULT field of var_stream_map */
     int has_video_m3u8; /* has video stream m3u8 list */
+    int use_jstrm;
 } HLSContext;
+
+static int hls_use_jstrm_manifest(const AVFormatContext *s)
+{
+    return !strcmp(s->oformat->name, "jstrm");
+}
+
+static void manifest_write_playlist_version(HLSContext *hls, AVIOContext *out, int version)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_playlist_version(out, version);
+    else
+        ff_hls_write_playlist_version(out, version);
+}
+
+static void manifest_write_audio_rendition(HLSContext *hls, AVIOContext *out,
+                                           const char *agroup, const char *filename,
+                                           const char *language, int name_id,
+                                           int is_default, int nb_channels)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_audio_rendition(out, agroup, filename, language, name_id,
+                                       is_default, nb_channels);
+    else
+        ff_hls_write_audio_rendition(out, agroup, filename, language, name_id,
+                                     is_default, nb_channels);
+}
+
+static void manifest_write_subtitle_rendition(HLSContext *hls, AVIOContext *out,
+                                              const char *sgroup, const char *filename,
+                                              const char *language, const char *sname,
+                                              int name_id, int is_default)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_subtitle_rendition(out, sgroup, filename, language, sname,
+                                          name_id, is_default);
+    else
+        ff_hls_write_subtitle_rendition(out, sgroup, filename, language, sname,
+                                        name_id, is_default);
+}
+
+static void manifest_write_stream_info(HLSContext *hls, AVStream *st, AVIOContext *out,
+                                       int bandwidth, int avg_bandwidth,
+                                       const char *filename, const char *agroup,
+                                       const char *codecs, const char *ccgroup,
+                                       const char *sgroup)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_stream_info(st, out, bandwidth, avg_bandwidth, filename,
+                                   agroup, codecs, ccgroup, sgroup);
+    else
+        ff_hls_write_stream_info(st, out, bandwidth, avg_bandwidth, filename,
+                                 agroup, codecs, ccgroup, sgroup);
+}
+
+static void manifest_write_playlist_header(HLSContext *hls, AVIOContext *out,
+                                           int version, int allowcache,
+                                           int target_duration, int64_t sequence,
+                                           uint32_t playlist_type, int iframe_mode)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_playlist_header(out, version, allowcache, target_duration,
+                                       sequence, playlist_type, iframe_mode);
+    else
+        ff_hls_write_playlist_header(out, version, allowcache, target_duration,
+                                     sequence, playlist_type, iframe_mode);
+}
+
+static void manifest_write_init_file(HLSContext *hls, AVIOContext *out,
+                                     const char *filename, int byterange_mode,
+                                     int64_t size, int64_t pos)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_init_file(out, filename, byterange_mode, size, pos);
+    else
+        ff_hls_write_init_file(out, filename, byterange_mode, size, pos);
+}
+
+static int manifest_write_file_entry(HLSContext *hls, AVIOContext *out,
+                                     int insert_discont, int byterange_mode,
+                                     double duration, int round_duration,
+                                     int64_t size, int64_t pos,
+                                     const char *baseurl, const char *filename,
+                                     double *prog_date_time,
+                                     int64_t video_keyframe_size,
+                                     int64_t video_keyframe_pos, int iframe_mode)
+{
+    if (hls->use_jstrm)
+        return ff_jstrm_write_file_entry(out, insert_discont, byterange_mode,
+                                         duration, round_duration, size, pos,
+                                         baseurl, filename, prog_date_time,
+                                         video_keyframe_size, video_keyframe_pos,
+                                         iframe_mode);
+
+    return ff_hls_write_file_entry(out, insert_discont, byterange_mode, duration,
+                                   round_duration, size, pos, baseurl, filename,
+                                   prog_date_time, video_keyframe_size,
+                                   video_keyframe_pos, iframe_mode);
+}
+
+static void manifest_write_end_list(HLSContext *hls, AVIOContext *out)
+{
+    if (hls->use_jstrm)
+        ff_jstrm_write_end_list(out);
+    else
+        ff_hls_write_end_list(out);
+}
 
 static int strftime_expand(const char *fmt, char **dest)
 {
@@ -1388,11 +1496,13 @@ static int create_master_playlist(AVFormatContext *s,
         goto fail;
     }
 
-    ff_hls_write_playlist_version(hls->m3u8_out, hls->version);
+    manifest_write_playlist_version(hls, hls->m3u8_out, hls->version);
 
     for (i = 0; i < hls->nb_ccstreams; i++) {
         ccs = &(hls->cc_streams[i]);
-        avio_printf(hls->m3u8_out, "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS");
+        avio_printf(hls->m3u8_out, "%s",
+                    hls->use_jstrm ? "#JSTRM-MEDIA:TYPE=CLOSED-CAPTIONS" :
+                                     "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS");
         avio_printf(hls->m3u8_out, ",GROUP-ID=\"%s\"", ccs->ccgroup);
         avio_printf(hls->m3u8_out, ",NAME=\"%s\"", ccs->instreamid);
         if (ccs->language)
@@ -1418,7 +1528,10 @@ static int create_master_playlist(AVFormatContext *s,
                 if (vs->streams[j]->codecpar->ch_layout.nb_channels > nb_channels)
                     nb_channels = vs->streams[j]->codecpar->ch_layout.nb_channels;
 
-        ff_hls_write_audio_rendition(hls->m3u8_out, vs->agroup, m3u8_rel_name, vs->language, i, hls->has_default_key ? vs->is_default : 1, nb_channels);
+        manifest_write_audio_rendition(hls, hls->m3u8_out, vs->agroup, m3u8_rel_name,
+                                       vs->language, i,
+                                       hls->has_default_key ? vs->is_default : 1,
+                                       nb_channels);
     }
 
     /* For variant streams with video add #EXT-X-STREAM-INF tag with attributes*/
@@ -1499,17 +1612,23 @@ static int create_master_playlist(AVFormatContext *s,
                 break;
             }
 
-            ff_hls_write_subtitle_rendition(hls->m3u8_out, sgroup, vtt_m3u8_rel_name, vs->language,
-                    vs->subtitle_varname, i, hls->has_default_key ? vs->is_default : 1);
+            manifest_write_subtitle_rendition(hls, hls->m3u8_out, sgroup,
+                                              vtt_m3u8_rel_name, vs->language,
+                                              vs->subtitle_varname, i,
+                                              hls->has_default_key ? vs->is_default : 1);
         }
 
         if (!hls->has_default_key || !hls->has_video_m3u8) {
-            ff_hls_write_stream_info(vid_st, hls->m3u8_out, bandwidth, avg_bandwidth, m3u8_rel_name,
-                    aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup);
+            manifest_write_stream_info(hls, vid_st, hls->m3u8_out, bandwidth,
+                                       avg_bandwidth, m3u8_rel_name,
+                                       aud_st ? vs->agroup : NULL, vs->codec_attr,
+                                       ccgroup, sgroup);
         } else {
             if (vid_st) {
-                ff_hls_write_stream_info(vid_st, hls->m3u8_out, bandwidth, avg_bandwidth, m3u8_rel_name,
-                                         aud_st ? vs->agroup : NULL, vs->codec_attr, ccgroup, sgroup);
+                manifest_write_stream_info(hls, vid_st, hls->m3u8_out, bandwidth,
+                                           avg_bandwidth, m3u8_rel_name,
+                                           aud_st ? vs->agroup : NULL, vs->codec_attr,
+                                           ccgroup, sgroup);
             }
         }
     }
@@ -1582,20 +1701,26 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
     }
 
     vs->discontinuity_set = 0;
-    ff_hls_write_playlist_header(byterange_mode ? hls->m3u8_out : vs->out, hls->version, hls->allowcache,
-                                 target_duration, sequence, hls->pl_type, hls->flags & HLS_I_FRAMES_ONLY);
+    manifest_write_playlist_header(hls, byterange_mode ? hls->m3u8_out : vs->out,
+                                   hls->version, hls->allowcache, target_duration,
+                                   sequence, hls->pl_type, hls->flags & HLS_I_FRAMES_ONLY);
 
     if ((hls->flags & HLS_DISCONT_START) && sequence==hls->start_sequence && vs->discontinuity_set==0) {
-        avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-DISCONTINUITY\n");
+        avio_printf(byterange_mode ? hls->m3u8_out : vs->out,
+                    hls->use_jstrm ? "#JSTRM-BREAK\n" : "#EXT-X-DISCONTINUITY\n");
         vs->discontinuity_set = 1;
     }
     if (vs->has_video && (hls->flags & HLS_INDEPENDENT_SEGMENTS)) {
-        avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-INDEPENDENT-SEGMENTS\n");
+        avio_printf(byterange_mode ? hls->m3u8_out : vs->out,
+                    hls->use_jstrm ? "#JSTRM-INDEPENDENT\n" : "#EXT-X-INDEPENDENT-SEGMENTS\n");
     }
     for (en = vs->segments; en; en = en->next) {
         if ((hls->encrypt || hls->key_info_file) && (!key_uri || strcmp(en->key_uri, key_uri) ||
                                     av_strcasecmp(en->iv_string, iv_string))) {
-            avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "#EXT-X-KEY:METHOD=AES-128,URI=\"%s\"", en->key_uri);
+            avio_printf(byterange_mode ? hls->m3u8_out : vs->out,
+                        hls->use_jstrm ? "#JSTRM-KEY:METHOD=AES-128,URI=\"%s\"" :
+                                         "#EXT-X-KEY:METHOD=AES-128,URI=\"%s\"",
+                        en->key_uri);
             if (*en->iv_string)
                 avio_printf(byterange_mode ? hls->m3u8_out : vs->out, ",IV=0x%s", en->iv_string);
             avio_printf(byterange_mode ? hls->m3u8_out : vs->out, "\n");
@@ -1604,16 +1729,18 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
         }
 
         if ((hls->segment_type == SEGMENT_TYPE_FMP4) && (en == vs->segments)) {
-            ff_hls_write_init_file(byterange_mode ? hls->m3u8_out : vs->out, (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
-                                   hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
+            manifest_write_init_file(hls, byterange_mode ? hls->m3u8_out : vs->out,
+                                     (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
+                                     hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
         }
 
-        ret = ff_hls_write_file_entry(byterange_mode ? hls->m3u8_out : vs->out, en->discont, byterange_mode,
-                                      en->duration, hls->flags & HLS_ROUND_DURATIONS,
-                                      en->size, en->pos, hls->baseurl,
-                                      en->filename,
-                                      en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
-                                      en->keyframe_size, en->keyframe_pos, hls->flags & HLS_I_FRAMES_ONLY);
+        ret = manifest_write_file_entry(hls, byterange_mode ? hls->m3u8_out : vs->out,
+                                        en->discont, byterange_mode, en->duration,
+                                        hls->flags & HLS_ROUND_DURATIONS, en->size,
+                                        en->pos, hls->baseurl, en->filename,
+                                        en->discont_program_date_time ? &en->discont_program_date_time : prog_date_time_p,
+                                        en->keyframe_size, en->keyframe_pos,
+                                        hls->flags & HLS_I_FRAMES_ONLY);
         if (en->discont_program_date_time)
             en->discont_program_date_time -= en->duration;
         if (ret < 0) {
@@ -1622,7 +1749,7 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
     }
 
     if (last && (hls->flags & HLS_OMIT_ENDLIST)==0)
-        ff_hls_write_end_list(byterange_mode ? hls->m3u8_out : vs->out);
+        manifest_write_end_list(hls, byterange_mode ? hls->m3u8_out : vs->out);
 
     if (vs->vtt_m3u8_name) {
         set_http_options(vs->vtt_avf, &options, hls);
@@ -1632,19 +1759,21 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
         if (ret < 0) {
             goto fail;
         }
-        ff_hls_write_playlist_header(hls->sub_m3u8_out, hls->version, hls->allowcache,
-                                     target_duration, sequence, PLAYLIST_TYPE_NONE, 0);
+        manifest_write_playlist_header(hls, hls->sub_m3u8_out, hls->version,
+                                       hls->allowcache, target_duration, sequence,
+                                       PLAYLIST_TYPE_NONE, 0);
         for (en = vs->segments; en; en = en->next) {
-            ret = ff_hls_write_file_entry(hls->sub_m3u8_out, en->discont, byterange_mode,
-                                          en->duration, 0, en->size, en->pos,
-                                          hls->baseurl, en->sub_filename, NULL, 0, 0, 0);
+            ret = manifest_write_file_entry(hls, hls->sub_m3u8_out, en->discont,
+                                            byterange_mode, en->duration, 0, en->size,
+                                            en->pos, hls->baseurl, en->sub_filename,
+                                            NULL, 0, 0, 0);
             if (ret < 0) {
                 av_log(s, AV_LOG_WARNING, "ff_hls_write_file_entry get error\n");
             }
         }
 
         if (last && !(hls->flags & HLS_OMIT_ENDLIST))
-            ff_hls_write_end_list(hls->sub_m3u8_out);
+            manifest_write_end_list(hls, hls->sub_m3u8_out);
 
     }
 
@@ -2881,6 +3010,7 @@ static int hls_init(AVFormatContext *s)
 
     hls->has_default_key = 0;
     hls->has_video_m3u8 = 0;
+    hls->use_jstrm = hls_use_jstrm_manifest(s);
     ret = update_variant_stream_info(s);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Variant stream info update failed with status %x\n",
@@ -3081,7 +3211,8 @@ static int hls_init(AVFormatContext *s)
                 if (ret < 0)
                     return ret;
             } else {
-                vs->vtt_m3u8_name = av_asprintf("%s_vtt.m3u8", vs->m3u8_name);
+                vs->vtt_m3u8_name = av_asprintf("%s_vtt.%s", vs->m3u8_name,
+                                                hls->use_jstrm ? "jstrm" : "m3u8");
                 if (!vs->vtt_m3u8_name)
                     return AVERROR(ENOMEM);
             }
@@ -3199,4 +3330,22 @@ const FFOutputFormat ff_hls_muxer = {
     .write_packet   = hls_write_packet,
     .write_trailer  = hls_write_trailer,
     .deinit         = hls_deinit,
+};
+
+const FFOutputFormat ff_jstrm_muxer = {
+    .p.name           = "jstrm",
+    .p.long_name      = NULL_IF_CONFIG_SMALL("JSTRM manifest stream"),
+    .p.extensions     = "jstrm",
+    .p.audio_codec    = AV_CODEC_ID_AAC,
+    .p.video_codec    = AV_CODEC_ID_H264,
+    .p.subtitle_codec = AV_CODEC_ID_WEBVTT,
+    .p.flags          = AVFMT_NOFILE | AVFMT_GLOBALHEADER | AVFMT_NODIMENSIONS,
+    .p.priv_class     = &hls_class,
+    .flags_internal   = FF_OFMT_FLAG_ALLOW_FLUSH,
+    .priv_data_size   = sizeof(HLSContext),
+    .init             = hls_init,
+    .write_header     = hls_write_header,
+    .write_packet     = hls_write_packet,
+    .write_trailer    = hls_write_trailer,
+    .deinit           = hls_deinit,
 };

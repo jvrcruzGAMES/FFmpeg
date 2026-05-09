@@ -2527,6 +2527,24 @@ Ignore IO errors during open, write and delete. Useful for long-duration runs wi
 Set custom HTTP headers, can override built in default headers. Applicable only for HTTP output.
 @end table
 
+@section jstrm
+
+JSTRM manifest stream muxer.
+
+This muxer follows the same segmented delivery model as the @ref{hls} muxer,
+but writes a distinct manifest language using the @code{.jstrm} extension and
+@code{#JSTRM-*} tags instead of the standard HLS @code{#EXT-X-*} vocabulary.
+
+It can reference MPEG-TS or fragmented MP4 segments and is suitable for jvid as
+well as other codecs supported by the selected segment container.
+
+All options supported by the @ref{hls} muxer are also supported by this muxer.
+
+For example:
+@example
+ffmpeg -i in.mkv -c copy -f jstrm out.jstrm
+@end example
+
 @section iamf
 Immersive Audio Model and Formats (IAMF) muxer.
 
