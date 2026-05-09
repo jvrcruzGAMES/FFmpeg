@@ -42,6 +42,7 @@ static const struct codec_string {
     { AV_CODEC_ID_VORBIS, "vorbis" },
     { AV_CODEC_ID_OPUS, "opus" },
     { AV_CODEC_ID_FLAC, "flac" },
+    { AV_CODEC_ID_JVID, "jvid" },
     { AV_CODEC_ID_NONE }
 };
 
