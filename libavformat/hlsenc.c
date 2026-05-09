@@ -583,7 +583,7 @@ static void write_styp(AVIOContext *pb)
     ffio_wfourcc(pb, "msix");
 }
 
-static int flush_dynbuf(VariantStream *vs, int *range_length)
+static int flush_dynbuf_internal(VariantStream *vs, int *range_length, int already_finalized)
 {
     AVFormatContext *ctx = vs->avf;
 
@@ -591,8 +591,8 @@ static int flush_dynbuf(VariantStream *vs, int *range_length)
         return AVERROR(EINVAL);
     }
 
-    // flush
-    av_write_frame(ctx, NULL);
+    if (!already_finalized)
+        av_write_frame(ctx, NULL);
 
     // write out to file
     *range_length = avio_close_dyn_buf(ctx->pb, &vs->temp_buffer);
@@ -602,6 +602,16 @@ static int flush_dynbuf(VariantStream *vs, int *range_length)
 
     // re-open buffer
     return avio_open_dyn_buf(&ctx->pb);
+}
+
+static int flush_dynbuf(VariantStream *vs, int *range_length)
+{
+    return flush_dynbuf_internal(vs, range_length, 0);
+}
+
+static int flush_closed_dynbuf(VariantStream *vs, int *range_length)
+{
+    return flush_dynbuf_internal(vs, range_length, 1);
 }
 
 static void reflush_dynbuf(VariantStream *vs, int *range_length)
@@ -981,7 +991,7 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
     if (hls->segment_type == SEGMENT_TYPE_FMP4) {
         av_dict_set(&options, "fflags", "-autobsf", 0);
         av_dict_set(&options, "movflags", "+frag_custom+dash+delay_moov", AV_DICT_APPEND);
-    } else {
+    } else if (!hls->use_jstrm) {
         /* We only require one PAT/PMT per segment. */
         char period[21];
         snprintf(period, sizeof(period), "%d", (INT_MAX / 2) - 1);
@@ -1924,7 +1934,7 @@ static int hls_start(AVFormatContext *s, VariantStream *vs)
         }
     }
     if (c->segment_type != SEGMENT_TYPE_FMP4) {
-        if (oc->oformat->priv_class && oc->priv_data) {
+        if (!c->use_jstrm && oc->oformat->priv_class && oc->priv_data) {
             av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
         }
         if (c->flags & HLS_SINGLE_FILE) {
@@ -1999,6 +2009,8 @@ static const char * get_default_pattern_localtime_fmt(AVFormatContext *s)
     if (hls->segment_type == SEGMENT_TYPE_FMP4) {
         return strftime_s_supported ? "-%s.m4s" : "-%Y%m%d%H%M%S.m4s";
     }
+    if (hls->use_jstrm)
+        return strftime_s_supported ? "-%s.jmov" : "-%Y%m%d%H%M%S.jmov";
     return strftime_s_supported ? "-%s.ts" : "-%Y%m%d%H%M%S.ts";
 }
 
@@ -2627,8 +2639,15 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         int64_t new_start_pos;
         int byterange_mode = (hls->flags & HLS_SINGLE_FILE) || (hls->max_seg_size > 0);
         double cur_duration;
+        int segment_closed = 0;
 
         av_write_frame(oc, NULL); /* Flush any buffered data */
+        if (hls->use_jstrm) {
+            ret = av_write_trailer(oc);
+            if (ret < 0)
+                return ret;
+            segment_closed = 1;
+        }
         new_start_pos = avio_tell(oc->pb);
         vs->size = new_start_pos - vs->start_pos;
         avio_flush(oc->pb);
@@ -2687,7 +2706,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 }
 
                 // look to rename the asset name
-                if (use_temp_file)
+                if (use_temp_file && !hls->use_jstrm)
                     av_dict_set(&options, "mpegts_flags", "resend_headers", 0);
 
                 set_http_options(s, &options, hls);
@@ -2703,7 +2722,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
                 if (hls->segment_type == SEGMENT_TYPE_FMP4) {
                     write_styp(vs->out);
                 }
-                ret = flush_dynbuf(vs, &range_length);
+                ret = segment_closed ? flush_closed_dynbuf(vs, &range_length) :
+                                       flush_dynbuf(vs, &range_length);
                 if (ret < 0) {
                     av_freep(&filename);
                     av_dict_free(&options);
@@ -2795,6 +2815,11 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
 
         if (ret < 0) {
             return ret;
+        }
+        if (hls->use_jstrm) {
+            ret = avformat_write_header(vs->avf, NULL);
+            if (ret < 0)
+                return ret;
         }
     }
 
@@ -2915,7 +2940,8 @@ static int hls_write_trailer(struct AVFormatContext *s)
             if (hls->segment_type == SEGMENT_TYPE_FMP4)
                 write_styp(vs->out);
         }
-        ret = flush_dynbuf(vs, &range_length);
+        ret = hls->use_jstrm ? flush_closed_dynbuf(vs, &range_length) :
+                               flush_dynbuf(vs, &range_length);
         if (ret < 0)
             goto failed;
 
@@ -3000,6 +3026,8 @@ static int hls_init(AVFormatContext *s)
     int fmp4_init_filename_len = strlen(hls->fmp4_init_filename) + 1;
     double initial_program_date_time = av_gettime() / 1000000.0;
 
+    hls->use_jstrm = hls_use_jstrm_manifest(s);
+
     if (hls->use_localtime) {
         pattern = get_default_pattern_localtime_fmt(s);
     } else {
@@ -3011,7 +3039,6 @@ static int hls_init(AVFormatContext *s)
 
     hls->has_default_key = 0;
     hls->has_video_m3u8 = 0;
-    hls->use_jstrm = hls_use_jstrm_manifest(s);
     ret = update_variant_stream_info(s);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Variant stream info update failed with status %x\n",

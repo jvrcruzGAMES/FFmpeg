@@ -315,7 +315,10 @@ static int jmov_write_packet(AVFormatContext *s, AVPacket *pkt)
 
 static int jmov_write_trailer(AVFormatContext *s)
 {
+    JMOVMuxContext *jmov = s->priv_data;
+
     jmov_write_chunk_header(s->pb, JMOV_TAG_DONE, 0);
+    jmov->wrote_data_chunk = 0;
     return 0;
 }
 

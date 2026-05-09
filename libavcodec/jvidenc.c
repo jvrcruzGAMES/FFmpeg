@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
@@ -62,6 +63,17 @@ typedef struct JVIDEncContext {
     int change_threshold;
     int key_frame;
 } JVIDEncContext;
+
+static AVRational jvid_get_framerate(AVCodecContext *avctx)
+{
+    if (avctx->framerate.num > 0 && avctx->framerate.den > 0)
+        return avctx->framerate;
+
+    if (avctx->time_base.num > 0 && avctx->time_base.den > 0)
+        return av_inv_q(avctx->time_base);
+
+    return (AVRational){ 0, 1 };
+}
 
 static uint8_t jvid_quantize_sample(uint8_t sample, int shift)
 {
@@ -233,6 +245,7 @@ static int jvid_encode_plane(JVIDEncContext *s, const uint8_t *src,
 static av_cold int jvid_encode_init(AVCodecContext *avctx)
 {
     JVIDEncContext *s = avctx->priv_data;
+    AVRational framerate;
     int ret;
 
     if (!avctx->width || !avctx->height) {
@@ -283,6 +296,21 @@ static av_cold int jvid_encode_init(AVCodecContext *avctx)
         s->quant_shift < 0 || s->quant_shift > 7 ||
         s->change_threshold < 0 || s->change_threshold > 255)
         return AVERROR(EINVAL);
+
+    framerate = jvid_get_framerate(avctx);
+    if (avctx->gop_size == 12 && framerate.num > 0 && framerate.den > 0) {
+        int64_t auto_gop = av_rescale_q(2, framerate, (AVRational){ 1, 1 });
+
+        if (auto_gop < 1)
+            auto_gop = 1;
+        if (auto_gop > INT_MAX)
+            auto_gop = INT_MAX;
+
+        avctx->gop_size = auto_gop;
+        av_log(avctx, AV_LOG_DEBUG,
+               "JVID auto-tuned GOP size to %d from framerate %d/%d.\n",
+               avctx->gop_size, framerate.num, framerate.den);
+    }
 
     avctx->bits_per_raw_sample = 8;
     ret = ff_deflate_init(&s->zstream, avctx->compression_level > 0 ?
