@@ -60,6 +60,7 @@ typedef struct JVIDEncContext {
     int block_size;
     int quant_shift;
     int change_threshold;
+    int key_frame;
 } JVIDEncContext;
 
 static uint8_t jvid_quantize_sample(uint8_t sample, int shift)
@@ -322,6 +323,7 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     int used_skip = 0;
     int zret, ret;
     AVFrame *sw_frame = NULL;
+    int force_intra;
 
     if (!frame) {
         av_log(avctx, AV_LOG_DEBUG, "JVID flush frame\n");
@@ -391,7 +393,11 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     if (ret < 0)
         return ret;
 
-    have_prev = s->has_prev_frame;
+    force_intra = avctx->gop_size == 0 || !s->has_prev_frame ||
+                  (avctx->gop_size > 0 && (avctx->frame_num % avctx->gop_size) == 0) ||
+                  frame->pict_type == AV_PICTURE_TYPE_I;
+    have_prev = !force_intra && s->has_prev_frame;
+    s->key_frame = force_intra;
     payload = s->payload;
     payload_end = s->payload + s->payload_alloc;
     scratch = payload_end - (s->block_size * s->block_size * 2);
@@ -464,7 +470,7 @@ static int jvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return AVERROR_EXTERNAL;
 
     pkt->size = JVID_HEADER_SIZE + zstream->total_out;
-    pkt->flags = used_skip ? 0 : AV_PKT_FLAG_KEY;
+    pkt->flags = s->key_frame ? AV_PKT_FLAG_KEY : 0;
     s->has_prev_frame = 1;
     *got_packet = 1;
 
