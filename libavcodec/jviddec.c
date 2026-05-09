@@ -92,6 +92,49 @@ static int jvid_ensure_buffer(uint8_t **buf, size_t *alloc, size_t size)
     return 0;
 }
 
+static int jvid_inflate_payload(AVCodecContext *avctx, JVIDContext *s,
+                                const uint8_t *src, int compressed_size,
+                                int inflated_size, const uint8_t **dst,
+                                int *dst_size)
+{
+    z_stream *zstream = &s->zstream.zstream;
+    int ret;
+
+    while (1) {
+        ret = jvid_ensure_buffer(&s->inflated, &s->inflated_alloc, inflated_size);
+        if (ret < 0)
+            return ret;
+
+        ret = inflateReset(zstream);
+        if (ret != Z_OK)
+            return AVERROR_EXTERNAL;
+
+        zstream->next_in   = (Bytef *)src;
+        zstream->avail_in  = compressed_size;
+        zstream->next_out  = s->inflated;
+        zstream->avail_out = inflated_size;
+
+        ret = inflate(zstream, Z_FINISH);
+        if (ret == Z_STREAM_END) {
+            *dst = s->inflated;
+            *dst_size = zstream->total_out;
+            return 0;
+        }
+
+        if ((ret != Z_BUF_ERROR && ret != Z_OK) || zstream->avail_out != 0) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid compressed JVID payload.\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (inflated_size > INT_MAX / 2 - 1024) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid compressed JVID payload.\n");
+            return AVERROR_INVALIDDATA;
+        }
+
+        inflated_size = inflated_size * 2 + 1024;
+    }
+}
+
 static int jvid_decode_init(AVCodecContext *avctx)
 {
     JVIDContext *s = avctx->priv_data;
@@ -485,24 +528,10 @@ static int jvid_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (hdr.flags & JVID_FLAG_DEFLATE) {
         int inflated_size = hdr.frame_type == JVID_FRAME_BLOCK_I420 ? payload_size * 3 + 1024 : payload_size;
 
-        ret = jvid_ensure_buffer(&s->inflated, &s->inflated_alloc, inflated_size);
+        ret = jvid_inflate_payload(avctx, s, src, compressed_size,
+                                   inflated_size, &src, &compressed_size);
         if (ret < 0)
             return ret;
-
-        zret = inflateReset(zstream);
-        if (zret != Z_OK)
-            return AVERROR_EXTERNAL;
-        zstream->next_in   = (Bytef *)src;
-        zstream->avail_in  = compressed_size;
-        zstream->next_out  = s->inflated;
-        zstream->avail_out = inflated_size;
-        zret = inflate(zstream, Z_FINISH);
-        if (zret != Z_STREAM_END) {
-            av_log(avctx, AV_LOG_ERROR, "Invalid compressed JVID payload.\n");
-            return AVERROR_INVALIDDATA;
-        }
-        src = s->inflated;
-        compressed_size = zstream->total_out;
     }
 
     if (hdr.frame_type == JVID_FRAME_BLOCK_I420) {
