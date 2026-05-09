@@ -1465,6 +1465,8 @@ static int get_pes_stream_id(AVFormatContext *s, AVStream *st, int stream_id, in
     if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         if (st->codecpar->codec_id == AV_CODEC_ID_DIRAC)
             return STREAM_ID_EXTENDED_STREAM_ID;
+        else if (st->codecpar->codec_id == AV_CODEC_ID_JVID)
+            return STREAM_ID_PRIVATE_STREAM_1;
         else
             return STREAM_ID_VIDEO_STREAM_0;
     } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
@@ -1679,7 +1681,9 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                 }
                 if (len > 0xffff)
                     len = 0;
-                if (ts->omit_video_pes_length && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                if (ts->omit_video_pes_length &&
+                    st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                    st->codecpar->codec_id != AV_CODEC_ID_JVID) {
                     len = 0;
                 }
                 *q++ = len >> 8;

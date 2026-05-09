@@ -1002,6 +1002,11 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
         sti->request_probe = AVPROBE_SCORE_STREAM_RETRY / 5;
     }
 
+    if (st->codecpar->codec_id == AV_CODEC_ID_JVID) {
+        sti->request_probe = 0;
+        sti->need_parsing  = 0;
+    }
+
     /* queue a context update if properties changed */
     if (old_codec_type != st->codecpar->codec_type ||
         old_codec_id   != st->codecpar->codec_id   ||
@@ -2235,6 +2240,10 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             mpegts_find_stream_type(st, st->codecpar->codec_tag, REGD_types);
             if (st->codecpar->codec_tag == MKTAG('B', 'S', 'S', 'D'))
                 sti->request_probe = 50;
+        }
+        if (st->codecpar->codec_id == AV_CODEC_ID_JVID) {
+            sti->request_probe = 0;
+            sti->need_parsing  = 0;
         }
         break;
     case STREAM_IDENTIFIER_DESCRIPTOR:
